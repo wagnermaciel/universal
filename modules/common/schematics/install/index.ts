@@ -18,8 +18,12 @@ import {
   findPropertyInAstObject,
   appendValueInAstArray,
 } from '@schematics/angular/utility/json-utils';
+import {relative} from 'path';
+import * as ts from 'typescript';
+
 import {Schema as UniversalOptions} from './schema';
 import {stripTsExtension, getDistPaths, getClientProject} from './utils';
+
 
 function addScriptsRule(options: UniversalOptions): Rule {
   return async host => {
@@ -120,6 +124,135 @@ function updateServerTsConfigRule(options: UniversalOptions): Rule {
   };
 }
 
+function findImportSpecifier(elements: ts.NodeArray<ts.ImportSpecifier>, importName: string) {
+  return elements.find(element => {
+    const {name, propertyName} = element;
+    return propertyName ? propertyName.text === importName : name.text === importName;
+  }) || null;
+}
+
+function findImport(sourceFile: ts.SourceFile,
+                    moduleName: string,
+                    symbolName: string): ts.NamedImports | null {
+  // Only look through the top-level imports.
+  for (const node of sourceFile.statements) {
+    if (!ts.isImportDeclaration(node) || !ts.isStringLiteral(node.moduleSpecifier) ||
+      node.moduleSpecifier.text !== moduleName) {
+      continue;
+    }
+
+    const namedBindings = node.importClause && node.importClause.namedBindings;
+
+    if (!namedBindings || !ts.isNamedImports(namedBindings)) {
+      continue;
+    }
+
+    if (findImportSpecifier(namedBindings.elements, symbolName)) {
+      return namedBindings;
+    }
+  }
+
+  return null;
+}
+
+/** Checks whether a node is referring to an import specifier. */
+function isReferenceToImport(typeChecker: ts.TypeChecker,
+                             node: ts.Node,
+                             importSpecifier: ts.ImportSpecifier | null): boolean {
+  if (importSpecifier) {
+    const nodeSymbol = typeChecker.getTypeAtLocation(node).getSymbol();
+    const importSymbol = typeChecker.getTypeAtLocation(importSpecifier).getSymbol();
+    return !!(nodeSymbol && importSymbol) &&
+      nodeSymbol.valueDeclaration === importSymbol.valueDeclaration;
+  }
+  return false;
+}
+
+function addInitialNavigation(node: ts.CallExpression): ts.CallExpression {
+  const existingOptions = node.arguments[1] as ts.ObjectLiteralExpression | undefined;
+
+  // If the user has explicitly set initialNavigation, we respect that
+  if (existingOptions && existingOptions.properties.find(exp =>
+    ts.isPropertyAssignment(exp) && ts.isIdentifier(exp.name) &&
+    exp.name.text === 'initialNavigation')) {
+    return node;
+  }
+
+  const initialNavigationProperty = ts.createPropertyAssignment('initialNavigation',
+    ts.createStringLiteral('enabled'));
+  const properties = [initialNavigationProperty];
+  const routerOptions = existingOptions ?
+    ts.updateObjectLiteral(existingOptions, properties) : ts.createObjectLiteral(properties, true);
+  const args = [node.arguments[0], routerOptions];
+  return ts.createCall(node.expression, node.typeArguments, args);
+}
+
+function routingInitialNavigationRule(options: UniversalOptions): Rule {
+  return async host => {
+    const clientProject = await getClientProject(host, options.clientProject);
+    const serverTarget = clientProject.targets.get('server');
+    if (!serverTarget || !serverTarget.options) {
+      return;
+    }
+
+    const tsConfigPath = serverTarget.options.tsConfig;
+    if (!tsConfigPath || typeof tsConfigPath !== 'string') {
+      // No tsconfig path
+      return;
+    }
+
+    const basePath = process.cwd();
+    const {config} = ts.readConfigFile(tsConfigPath, ts.sys.readFile);
+    const parseConfigHost = {
+      useCaseSensitiveFileNames: ts.sys.useCaseSensitiveFileNames,
+      fileExists: ts.sys.fileExists,
+      readDirectory: ts.sys.readDirectory,
+      readFile: ts.sys.readFile,
+    };
+    const parsed = ts.parseJsonConfigFileContent(config, parseConfigHost, basePath, {});
+    const tsHost = ts.createCompilerHost(parsed.options, true);
+    const program = ts.createProgram(parsed.fileNames, parsed.options, tsHost);
+    const typeChecker = program.getTypeChecker();
+    const printer = ts.createPrinter();
+    const sourceFiles = program.getSourceFiles().filter(
+      f => !f.isDeclarationFile && !program.isSourceFileFromExternalLibrary(f));
+    const routerModule = 'RouterModule';
+
+    sourceFiles.forEach(sourceFile => {
+      const routerImport = findImport(sourceFile, '@angular/router', routerModule);
+      if (!routerImport) {
+        return;
+      }
+
+      const importSpecifier = findImportSpecifier(routerImport.elements, routerModule);
+
+      let routerModuleNode: ts.CallExpression;
+      ts.forEachChild(sourceFile, function visitNode(node: ts.Node) {
+        if (ts.isCallExpression(node) && ts.isPropertyAccessExpression(node.expression) &&
+          isReferenceToImport(typeChecker, node.expression.expression, importSpecifier) &&
+          node.expression.name.text === 'forRoot') {
+          routerModuleNode = node;
+          return;
+        }
+
+        ts.forEachChild(node, visitNode);
+      });
+
+      if (routerModuleNode) {
+        const update = host.beginUpdate(relative(basePath, sourceFile.fileName));
+        update.remove(routerModuleNode.getStart(), routerModuleNode.getWidth());
+        update.insertRight(
+          routerModuleNode.getStart(),
+          printer.printNode(
+            ts.EmitHint.Unspecified, addInitialNavigation(routerModuleNode),
+            sourceFile));
+
+        host.commitUpdate(update);
+      }
+    });
+  };
+}
+
 export default function (options: UniversalOptions): Rule {
   return async host => {
     const clientProject = await getClientProject(host, options.clientProject);
@@ -131,6 +264,7 @@ export default function (options: UniversalOptions): Rule {
       addScriptsRule(options),
       updateServerTsConfigRule(options),
       updateConfigFileRule(options),
+      routingInitialNavigationRule(options),
     ]);
   };
 }
